@@ -1,0 +1,27 @@
+# vpn-dns-watcher configuration
+#
+# Each entry maps a domain to one or more DNS servers that should be used
+# for that domain ONLY while those DNS servers are reachable through a
+# VPN tunnel interface (utun*) on this Mac.
+#
+# Detection is automatic and per-entry: the watcher checks, for each host,
+# whether at least one of its listed nameservers currently routes through
+# a utun interface. No separate "which VPN" configuration is needed —
+# just list the DNS server(s) that only make sense while that tunnel is up.
+#
+# When the relevant tunnel is down, the corresponding /etc/resolver
+# override is removed automatically, so normal DNS resolution resumes.
+#
+# Add as many entries as you need; no restart or reinstall required —
+# the daemon re-reads this file on every poll.
+
+hosts:
+  - domain: database.windows.net
+    nameservers:
+      - 10.0.0.53
+
+  # Example of a second entry, possibly behind a different VPN/DNS server.
+  # - domain: privatelink.blob.core.windows.net
+  #   nameservers:
+  #     - 10.0.0.53
+  #     - 168.63.129.16

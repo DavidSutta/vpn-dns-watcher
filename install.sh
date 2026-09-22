@@ -39,9 +39,25 @@ fi
 install -m 644 "$REPO_DIR/launchd/com.github.vpn-dns-watcher.plist" "$PLIST_DEST"
 chown root:wheel "$PLIST_DEST"
 
+# launchd refuses to bootstrap a quarantined daemon, failing with the
+# unhelpful "Bootstrap failed: 5: Input/output error". `install` copies
+# extended attributes along with the file, so a com.apple.quarantine flag
+# on the checked-out plist follows it into /Library/LaunchDaemons.
+xattr -d com.apple.quarantine "$PLIST_DEST" 2>/dev/null || true
+xattr -d com.apple.quarantine "$BIN_DIR/vpn-dns-watcher.sh" 2>/dev/null || true
+
 # Unload first in case of re-install, ignore errors if not currently loaded
 launchctl bootout system "$PLIST_DEST" 2>/dev/null || true
-launchctl bootstrap system "$PLIST_DEST"
+
+if ! launchctl bootstrap system "$PLIST_DEST"; then
+    echo ""
+    echo "launchctl could not start the daemon (see the error above)."
+    echo "Things worth checking:"
+    echo "  - Is it already running?   sudo launchctl print system/com.github.vpn-dns-watcher"
+    echo "  - Is it disabled?          sudo launchctl print-disabled system | grep vpn-dns"
+    echo "  - Any leftover quarantine? xattr $PLIST_DEST"
+    exit 1
+fi
 
 echo ""
 echo "Installed and started vpn-dns-watcher."

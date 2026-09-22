@@ -1,34 +1,56 @@
 # vpn-dns-watcher
 
-A tiny macOS root daemon that automatically manages `/etc/resolver/<domain>`
-split-DNS overrides based on whether a VPN tunnel is actually up — no
-hooks required from the VPN client itself.
+Automatically turns macOS split-DNS overrides on when your VPN connects,
+and off when it disconnects — without any help from the VPN client.
 
-## Why
+## The problem this solves
 
-Many macOS VPN clients (Azure VPN Client included) are built on Apple's
-Network Extension framework and don't expose any pre/post-connect
-scripting hooks the way older OpenVPN-based clients did. This makes it
-hard to automatically switch DNS resolution for specific internal domains
-(e.g. private-endpoint-backed Azure services) on and off as you connect
-and disconnect.
+You connect to a corporate VPN to reach an internal service. The tunnel
+is up, but the name still resolves to the wrong address — a public IP, or
+nothing at all — so every connection hangs or is refused:
 
-`vpn-dns-watcher` sidesteps this by not needing a hook at all: it polls
-the routing table every few seconds and asks, for each domain you
-configure, *"is this domain's DNS server currently reachable through a
-VPN tunnel interface?"* If yes, it writes the matching `/etc/resolver`
-override. If no, it removes it. Your normal DNS resolution is otherwise
-untouched.
+```
+$ nslookup myservice.internal.example.com
+Address: 203.0.113.10          # public IP, not the private one behind the VPN
 
-## Requirements
+$ psql -h myservice.internal.example.com
+psql: error: connection to server ... failed: Operation timed out
+```
 
-- macOS
-- [`yq`](https://github.com/mikefarah/yq) (the Go version, by mikefarah):
-  ```bash
-  brew install yq
-  ```
+The fix is a `/etc/resolver/<domain>` file telling macOS to resolve that
+domain through the VPN's private DNS server. But it has to be created
+when you connect and **deleted when you disconnect** — leave it in place
+off-VPN and every lookup for that domain hangs against an unreachable
+nameserver.
+
+Older VPN clients let you script this with connect/disconnect hooks.
+Modern macOS clients built on Apple's Network Extension framework (the
+Azure VPN Client among them) expose no such hooks, so you are left doing
+it by hand, with sudo, several times a day.
+
+`vpn-dns-watcher` does it for you.
+
+## How it works
+
+It needs no hook because it never asks the VPN client anything. A root
+LaunchDaemon wakes every 5 seconds and, for each domain you configured,
+runs `route -n get <nameserver-ip>` to ask which interface macOS would
+use to reach that nameserver. If the answer is a `utun*` interface, the
+tunnel is up: write the resolver file. If not: remove it.
+
+Two useful consequences:
+
+- **Works with any VPN client**, since nothing depends on app names or on
+  a specific `utun` number (those change between sessions).
+- **Handles several VPNs at once**, since each entry is tested on its own.
+
+It only writes when something actually changed, and only touches files
+carrying its own marker comment — resolver files you wrote yourself are
+never modified or deleted.
 
 ## Install
+
+Requires [`yq`](https://github.com/mikefarah/yq) (`brew install yq`).
 
 ```bash
 git clone <this-repo> vpn-dns-watcher
@@ -36,66 +58,51 @@ cd vpn-dns-watcher
 sudo ./install.sh
 ```
 
-This installs:
-
 | What | Where |
 |---|---|
 | Watcher script | `/usr/local/libexec/vpn-dns-watcher/vpn-dns-watcher.sh` |
 | Config | `/usr/local/etc/vpn-dns-watcher/config.yml` |
-| Logs | `/usr/local/var/log/vpn-dns-watcher.log` |
+| Log | `/usr/local/var/log/vpn-dns-watcher.log` |
 | LaunchDaemon | `/Library/LaunchDaemons/com.github.vpn-dns-watcher.plist` |
 
-It runs as **root** (via LaunchDaemon, not a per-user LaunchAgent), which
-is required to write to `/etc/resolver/` and flush the DNS cache — this
-avoids needing any passwordless-sudo configuration.
+It runs as root because writing `/etc/resolver/` and flushing the DNS
+cache require it — this avoids configuring passwordless sudo.
 
-## Configuring hosts
+## Configure
 
-Edit `/usr/local/etc/vpn-dns-watcher/config.yml`:
+The shipped config is empty. Add your domains to
+`/usr/local/etc/vpn-dns-watcher/config.yml`:
 
 ```yaml
 hosts:
-  - domain: database.windows.net
+  - domain: internal.example.com
     nameservers:
       - 10.0.0.53
 
-  - domain: privatelink.blob.core.windows.net
+  - domain: db.internal.example.com
     nameservers:
       - 10.0.0.53
-      - 168.63.129.16
+      - 10.0.1.53
 ```
 
-- `domain` — the DNS suffix to override (matches how `/etc/resolver`
-  files work; this becomes the filename).
-- `nameservers` — one or more DNS servers to use for that domain **while
-  at least one of them is reachable through a `utun*` interface**.
+- `domain` — the DNS suffix to override; this becomes the
+  `/etc/resolver/` filename.
+- `nameservers` — the DNS server(s) to use for it, listed in priority
+  order. These should be servers that are only reachable over the VPN.
 
-No restart is needed after editing — the daemon re-reads the config on
-every poll (every 5 seconds by default; change `StartInterval` in the
-plist and re-run `install.sh` to adjust).
+No restart needed; the daemon re-reads the config on the next poll.
+To change the 5-second interval, edit `StartInterval` in the plist and
+re-run `install.sh`.
 
-You can add as many host entries as you like, pointing at different DNS
-servers for different VPNs — detection is per-entry, so this scales to
-multiple unrelated tunnels without any extra configuration.
-
-## How detection works
-
-For each configured nameserver IP, the watcher runs:
-
-```bash
-route -n get <nameserver-ip>
-```
-
-and checks whether the interface macOS would actually use to reach that
-IP starts with `utun`. If so, the tunnel is considered "up" for that
-entry, regardless of which specific VPN client created it. This avoids
-hardcoding a particular `utun` number (which can change between VPN
-sessions) or depending on a specific VPN app's naming.
-
-## Logs
+## Check it
 
 ```bash
 tail -f /usr/local/var/log/vpn-dns-watcher.log
+```
+
+```
+2026-01-15 09:12:03 Applied resolver override for internal.example.com -> 10.0.0.53 (via utun4)
+2026-01-15 17:40:18 Removed resolver override for internal.example.com (no tunnel route to its DNS server)
 ```
 
 ## Uninstall
@@ -104,21 +111,15 @@ tail -f /usr/local/var/log/vpn-dns-watcher.log
 sudo ./uninstall.sh
 ```
 
-Removes the LaunchDaemon and any `/etc/resolver` files this tool
-created (identified by an internal marker comment — your own manually
-created resolver files are left untouched).
+Removes the daemon and the resolver files it created, then offers to
+remove the config.
 
-## Caveats
+## Limits
 
-- Polling interval is a trade-off: shorter intervals react faster to
-  connect/disconnect but wake the CPU more often. 5 seconds is a
-  reasonable default for interactive dev use.
-- This only manages DNS resolution for the domains you list — it does
-  not touch routing tables. If your VPN client also has a forced-tunnel
-  routing gap (traffic not actually going through the tunnel even after
-  DNS resolves correctly), that's a separate problem to solve on the
-  VPN client / gateway side.
-- IPv6 is not addressed by this tool.
+- DNS only. If traffic still fails after the name resolves correctly,
+  that is a routing problem on the VPN client or gateway, not here.
+- IPv6 is not handled.
+- Shorter poll intervals react faster but wake the CPU more often.
 
 ## License
 

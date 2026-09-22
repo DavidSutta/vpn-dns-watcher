@@ -13,7 +13,7 @@ set -uo pipefail
 
 CONFIG_FILE="${VPN_DNS_WATCHER_CONFIG:-/usr/local/etc/vpn-dns-watcher/config.yml}"
 LOG_FILE="${VPN_DNS_WATCHER_LOG:-/usr/local/var/log/vpn-dns-watcher.log}"
-RESOLVER_DIR="/etc/resolver"
+RESOLVER_DIR="${VPN_DNS_WATCHER_RESOLVER_DIR:-/etc/resolver}"
 MARKER="# Managed by vpn-dns-watcher -- do not edit manually"
 
 log() {
@@ -38,7 +38,10 @@ if ! [[ "$host_count" =~ ^[0-9]+$ ]]; then
     fail "could not parse 'hosts' array from $CONFIG_FILE"
 fi
 
-for i in $(seq 0 $((host_count - 1))); do
+# C-style loop, not `seq 0 $((n-1))`: BSD seq counts *down* when the
+# first value exceeds the last, so an empty hosts list would iterate over
+# 0 and -1 instead of not iterating at all.
+for ((i = 0; i < host_count; i++)); do
     domain="$(yq -r ".hosts[$i].domain" "$CONFIG_FILE")"
 
     if [ -z "$domain" ] || [ "$domain" == "null" ]; then
@@ -77,10 +80,10 @@ for i in $(seq 0 $((host_count - 1))); do
             desired_content+="nameserver $ns"$'\n'
         done
 
-        current_content=""
-        [ -f "$resolver_file" ] && current_content="$(cat "$resolver_file")"
-
-        if [ "$current_content" != "$desired_content" ]; then
+        # Byte-exact comparison: command substitution strips trailing
+        # newlines, which would make an unchanged file always look different
+        # and cause a needless rewrite plus DNS flush on every poll.
+        if ! printf '%s' "$desired_content" | cmp -s - "$resolver_file"; then
             printf '%s' "$desired_content" > "$resolver_file"
             log "Applied resolver override for $domain -> ${nameservers[*]} (via $matched_iface)"
             changed=1
